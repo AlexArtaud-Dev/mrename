@@ -1,0 +1,57 @@
+# Pushing a tag like v1.1.0 builds static Linux binaries and publishes them as a GitHub release,
+# with SHA256SUMS and the Canopy plugin manifest (its version taken from the tag).
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, platform: linux-amd64 }
+          - { runner: ubuntu-24.04-arm, platform: linux-arm64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: make VERSION="${GITHUB_REF_NAME#v}" LDFLAGS="-static -s"
+      - name: Check
+        run: |
+          ./mrename --version
+          mkdir samples && touch samples/Show.S01E02.mkv
+          ./mrename --pattern auto --name Show --dry-run samples
+      - run: mv mrename mrename-${{ matrix.platform }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mrename-${{ matrix.platform }}
+          path: mrename-${{ matrix.platform }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums and manifest
+        run: |
+          sed "s/^version: .*/version: ${GITHUB_REF_NAME#v}/" canopy-plugin.yaml > dist/canopy-plugin.yaml
+          cd dist
+          chmod +x mrename-linux-*
+          sha256sum mrename-linux-* > SHA256SUMS
+          cat SHA256SUMS
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes

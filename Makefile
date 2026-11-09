@@ -1,8 +1,9 @@
 # Makefile for TV Series Renamer
 
 CC = gcc
-CFLAGS = -Wall -Wextra -O3 -std=c11 -D_GNU_SOURCE
-LDFLAGS = 
+VERSION ?= dev
+CFLAGS = -Wall -Wextra -O3 -std=c11 -D_GNU_SOURCE -DMRENAME_VERSION=\"$(VERSION)\"
+LDFLAGS =
 TARGET = mrename
 SOURCE = mrename.c
 
