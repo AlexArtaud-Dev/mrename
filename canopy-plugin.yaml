@@ -1,0 +1,56 @@
+# Canopy plugin manifest. The release workflow sets `version` from the tag and publishes this
+# file next to the binaries and SHA256SUMS.
+id: mrename
+name: { en: TV series renamer, fr: Renommage de séries, es: Renombrador de series }
+description:
+  en: Renames the episodes of a series to "Name S01E05.ext" from the numbers found in their file names.
+  fr: Renomme les épisodes d’une série en « Nom S01E05.ext » à partir des numéros trouvés dans leurs noms.
+  es: Renombra los episodios de una serie como «Nombre S01E05.ext» a partir de los números de sus nombres.
+version: 0.0.0
+binary: mrename
+source:
+  repo: AlexArtaud-Dev/mrename
+  checksums: SHA256SUMS
+  assets:
+    linux-amd64: mrename-linux-amd64
+    linux-arm64: mrename-linux-arm64
+commands:
+  - id: mrename.rename
+    name: { en: Rename episodes, fr: Renommer des épisodes, es: Renombrar episodios }
+    description:
+      en: Video files whose names match the pattern get the series name and their season and episode numbers. Existing files are never overwritten.
+      fr: Les vidéos dont le nom correspond au modèle reçoivent le nom de la série et leurs numéros de saison et d’épisode. Aucun fichier existant n’est écrasé.
+      es: Los vídeos cuyo nombre coincide con el patrón reciben el nombre de la serie y sus números de temporada y episodio. Nunca se sobrescribe un archivo existente.
+    binary: mrename
+    mode: basic
+    params:
+      - name: folder
+        type: path
+        access: update
+        required: true
+        label: { en: Series folder, fr: Dossier de la série, es: Carpeta de la serie }
+      - name: seriesName
+        type: string
+        required: true
+        pattern: '^[^/\\<>:"|?*]{1,200}$'
+        label: { en: Series name, fr: Nom de la série, es: Nombre de la serie }
+      - name: pattern
+        type: enum
+        default: auto
+        values:
+          - auto
+          - standard
+          - case-insensitive
+          - alternative
+          - verbose
+          - flexible
+          - episode
+          - short-episode
+          - minimal-episode
+          - dot
+          - combined
+        label: { en: Naming pattern, fr: Modèle de nom, es: Patrón de nombre }
+    args: ['--pattern', '{pattern}', '--name', '{seriesName}', '{folder}']
+    progressParser: line-count
+    dryRun: { flag: '--dry-run' }
+    timeout: 1h

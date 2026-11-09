@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,8 +11,15 @@
 #include <ctype.h>
 #include <time.h>
 #include <stdarg.h>
+#include <errno.h>
+#include <getopt.h>
+
+#ifndef MRENAME_VERSION
+#define MRENAME_VERSION "dev"
+#endif
 
 #define MAX_PATH 4096
+#define MAX_NAME 200
 #define MAX_FILES 10000
 #define MAX_PATTERNS 10
 #define MAX_MATCHES 10
@@ -33,8 +42,13 @@
 #define MOVE_DOWN(n) printf("\033[%dB", n)
 #define CLEAR_LINE "\033[K"
 
+// Colors and screen control only when writing to a terminal (and NO_COLOR is not set)
+static int use_color = 0;
+#define C(code) (use_color ? (code) : "")
+
 // Pattern structure
 typedef struct {
+    const char *id;
     const char *name;
     const char *regex;
     const char *description;
@@ -59,16 +73,16 @@ typedef struct {
 
 // Global patterns
 const Pattern patterns[] = {
-    {"Standard", "S([0-9]+)E([0-9]+)", "S01E05, S1E12", 1},
-    {"Case Insensitive", "[Ss]([0-9]+)[Ee]([0-9]+)", "s01e05, S01E05", 1},
-    {"Alternative", "([0-9]+)x([0-9]+)", "1x05, 01x12", 1},
-    {"Verbose", "Season\\.([0-9]+)\\.Episode\\.([0-9]+)", "Season.1.Episode.5", 1},
-    {"Flexible", "[Ss]eason[\\.\\s]*([0-9]+)[\\.\\s]*[Ee]pisode[\\.\\s]*([0-9]+)", "Season 1 Episode 5", 1},
-    {"Episode Only", "Episode[\\.\\s]*([0-9]+)", "Episode.5, Episode 12", 0},
-    {"Short Episode", "[Ee]p[\\.\\s]*([0-9]+)", "Ep.5, ep 12", 0},
-    {"Minimal Episode", "[Ee]([0-9]+)", "E05, e12", 0},
-    {"Dot Notation", "\\.([0-9]+)\\.", ".1204.", 0},
-    {"Combined", "([0-9]{1,2})([0-9]{2})", "105 (S1E05), 1205 (S12E05)", 1}
+    {"standard", "Standard", "S([0-9]+)E([0-9]+)", "S01E05, S1E12", 1},
+    {"case-insensitive", "Case Insensitive", "[Ss]([0-9]+)[Ee]([0-9]+)", "s01e05, S01E05", 1},
+    {"alternative", "Alternative", "([0-9]+)x([0-9]+)", "1x05, 01x12", 1},
+    {"verbose", "Verbose", "Season\\.([0-9]+)\\.Episode\\.([0-9]+)", "Season.1.Episode.5", 1},
+    {"flexible", "Flexible", "[Ss]eason[[:space:]._-]*([0-9]+)[[:space:]._-]*[Ee]pisode[[:space:]._-]*([0-9]+)", "Season 1 Episode 5", 1},
+    {"episode", "Episode Only", "Episode[[:space:]._-]*([0-9]+)", "Episode.5, Episode 12", 0},
+    {"short-episode", "Short Episode", "[Ee]p[[:space:]._-]*([0-9]+)", "Ep.5, ep 12", 0},
+    {"minimal-episode", "Minimal Episode", "[Ee]([0-9]+)", "E05, e12", 0},
+    {"dot", "Dot Notation", "\\.([0-9]+)\\.", ".1204.", 0},
+    {"combined", "Combined", "([0-9]{1,2})([0-9]{2})", "105 (S1E05), 1205 (S12E05)", 1}
 };
 
 const int num_patterns = sizeof(patterns) / sizeof(patterns[0]);
@@ -77,19 +91,30 @@ const int num_patterns = sizeof(patterns) / sizeof(patterns[0]);
 void print_color(const char *color, const char *format, ...) {
     va_list args;
     va_start(args, format);
-    printf("%s", color);
+    printf("%s", C(color));
     vprintf(format, args);
-    printf("%s", RESET);
+    printf("%s", C(RESET));
     va_end(args);
 }
 
 // Function to draw a horizontal line
 void draw_line(int width, const char *color) {
-    printf("%s", color);
+    printf("%s", C(color));
     for (int i = 0; i < width; i++) {
         printf("━");
     }
-    printf("%s\n", RESET);
+    printf("%s\n", C(RESET));
+}
+
+// Reads a captured number, capped so that long digit runs cannot overflow the buffer
+static int captured_number(const char *text, regmatch_t match) {
+    char digits[10];
+    int len = match.rm_eo - match.rm_so;
+    if (len <= 0) return 0;
+    if (len > (int)sizeof(digits) - 1) len = sizeof(digits) - 1;
+    memcpy(digits, text + match.rm_so, len);
+    digits[len] = '\0';
+    return atoi(digits);
 }
 
 // Function to draw a box
@@ -142,6 +167,10 @@ int is_video_file(const char *filename) {
     return 0;
 }
 
+static int compare_files(const void *a, const void *b) {
+    return strcmp(((const FileInfo *)a)->basename, ((const FileInfo *)b)->basename);
+}
+
 // Scan directory for video files
 int scan_directory(const char *dir_path, FileInfo **files) {
     DIR *dir;
@@ -180,6 +209,8 @@ int scan_directory(const char *dir_path, FileInfo **files) {
     }
     
     closedir(dir);
+    // Directory order is arbitrary; a stable order makes previews and logs predictable
+    qsort(*files, count, sizeof(FileInfo), compare_files);
     return count;
 }
 
@@ -196,28 +227,15 @@ PatternResult test_pattern(const Pattern *pattern, FileInfo *files, int file_cou
     for (int i = 0; i < file_count; i++) {
         if (regexec(&regex, files[i].basename, MAX_MATCHES, matches, 0) == 0) {
             files[i].matched = 1;
+            files[i].season = 0;
+            files[i].episode = 0;
             result.total_matches++;
-            
+
             if (pattern->has_season && matches[1].rm_so != -1 && matches[2].rm_so != -1) {
-                char season_str[10], episode_str[10];
-                int len;
-                
-                len = matches[1].rm_eo - matches[1].rm_so;
-                strncpy(season_str, files[i].basename + matches[1].rm_so, len);
-                season_str[len] = '\0';
-                files[i].season = atoi(season_str);
-                
-                len = matches[2].rm_eo - matches[2].rm_so;
-                strncpy(episode_str, files[i].basename + matches[2].rm_so, len);
-                episode_str[len] = '\0';
-                files[i].episode = atoi(episode_str);
+                files[i].season = captured_number(files[i].basename, matches[1]);
+                files[i].episode = captured_number(files[i].basename, matches[2]);
             } else if (!pattern->has_season && matches[1].rm_so != -1) {
-                char episode_str[10];
-                int len = matches[1].rm_eo - matches[1].rm_so;
-                strncpy(episode_str, files[i].basename + matches[1].rm_so, len);
-                episode_str[len] = '\0';
-                files[i].season = 0;
-                files[i].episode = atoi(episode_str);
+                files[i].episode = captured_number(files[i].basename, matches[1]);
             }
         } else {
             files[i].matched = 0;
@@ -225,18 +243,18 @@ PatternResult test_pattern(const Pattern *pattern, FileInfo *files, int file_cou
     }
     
     regfree(&regex);
-    result.match_percentage = (double)result.total_matches / file_count * 100.0;
+    result.match_percentage = file_count > 0 ? (double)result.total_matches / file_count * 100.0 : 0.0;
     return result;
 }
 
 // Generate new filename
 void generate_new_name(FileInfo *file, const char *series_name) {
-    char clean_name[256];
-    strcpy(clean_name, series_name);
-    
-    // Clean series name
+    char clean_name[MAX_NAME + 1];
+    snprintf(clean_name, sizeof(clean_name), "%s", series_name);
+
+    // Clean series name: no path separators, reserved or control characters
     for (int i = 0; clean_name[i]; i++) {
-        if (strchr("<>:\"/\\|?*", clean_name[i])) {
+        if (strchr("<>:\"/\\|?*", clean_name[i]) || iscntrl((unsigned char)clean_name[i])) {
             clean_name[i] = '_';
         }
     }
@@ -278,11 +296,11 @@ void display_pattern_analysis(PatternResult *results, int file_count) {
         else color = DIM;
         
         printf("┃ %s%-3d%s ┃ %-25s ┃ %s%-25s%s ┃ %s%8d%s ┃ %s%6s%s ┃\n",
-               color, i + 1, RESET,
+               C(color), i + 1, C(RESET),
                patterns[i].name,
-               DIM, patterns[i].description, RESET,
-               color, results[i].total_matches, RESET,
-               color, rate, RESET);
+               C(DIM), patterns[i].description, C(RESET),
+               C(color), results[i].total_matches, C(RESET),
+               C(color), rate, C(RESET));
         
         if (results[i].match_percentage > best_percentage) {
             best_percentage = results[i].match_percentage;
@@ -333,45 +351,84 @@ void display_rename_preview(FileInfo *files, int file_count) {
     }
 }
 
+// Outcome of renaming one file
+typedef enum {
+    RENAME_DONE,
+    RENAME_UNCHANGED,  // already has the target name
+    RENAME_EXISTS,     // another file already has the target name: never overwritten
+    RENAME_DUPLICATE,  // an earlier file in this batch gets the same name
+    RENAME_ERROR       // the system refused (errno set)
+} RenameOutcome;
+
+// Another matched file before this one is given the same new name
+static int duplicate_target(FileInfo *files, int index) {
+    for (int i = 0; i < index; i++) {
+        if (files[i].matched && files[i].new_name && strcmp(files[i].new_name, files[index].new_name) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Renames one file in place; with dry_run, only says what would happen
+static RenameOutcome rename_one(FileInfo *files, int index, int dry_run) {
+    FileInfo *file = &files[index];
+    char new_path[MAX_PATH];
+    struct stat st;
+
+    if (strcmp(file->basename, file->new_name) == 0) return RENAME_UNCHANGED;
+    if (duplicate_target(files, index)) return RENAME_DUPLICATE;
+
+    char *dir = strdup(file->original_path);
+    if (!dir) {
+        errno = ENOMEM;
+        return RENAME_ERROR;
+    }
+    char *last_slash = strrchr(dir, '/');
+    if (last_slash) *last_slash = '\0';
+    snprintf(new_path, MAX_PATH, "%s/%s", dir, file->new_name);
+    free(dir);
+
+    if (lstat(new_path, &st) == 0) return RENAME_EXISTS;
+    if (dry_run) return RENAME_DONE;
+    return rename(file->original_path, new_path) == 0 ? RENAME_DONE : RENAME_ERROR;
+}
+
 // Perform the actual renaming
 int perform_rename(FileInfo *files, int file_count) {
     int success = 0, failed = 0;
-    char new_path[MAX_PATH];
-    
+
     printf("\n");
     draw_line(80, CYAN);
     print_color(BOLD CYAN, "Renaming files...\n");
     draw_line(80, CYAN);
-    
+
     for (int i = 0; i < file_count; i++) {
         if (files[i].matched && files[i].new_name) {
-            char *dir = strdup(files[i].original_path);
-            char *last_slash = strrchr(dir, '/');
-            if (last_slash) *last_slash = '\0';
-            
-            snprintf(new_path, MAX_PATH, "%s/%s", dir, files[i].new_name);
-            
-            if (rename(files[i].original_path, new_path) == 0) {
+            RenameOutcome outcome = rename_one(files, i, 0);
+            if (outcome == RENAME_DONE) {
                 print_color(GREEN, "✓ ");
                 printf("Renamed: %s\n", files[i].new_name);
                 success++;
+            } else if (outcome == RENAME_UNCHANGED) {
+                print_color(DIM, "= Already named: %s\n", files[i].basename);
             } else {
                 print_color(RED, "✗ ");
-                printf("Failed: %s\n", files[i].basename);
+                printf("Failed: %s (%s)\n", files[i].basename,
+                       outcome == RENAME_EXISTS ? "target exists" :
+                       outcome == RENAME_DUPLICATE ? "same name as another file" : strerror(errno));
                 failed++;
             }
-            
-            free(dir);
         }
     }
-    
+
     printf("\n");
     print_color(BOLD GREEN, "✓ Success: %d files\n", success);
     if (failed > 0) {
         print_color(BOLD RED, "✗ Failed: %d files\n", failed);
     }
-    
-    return success;
+
+    return failed;
 }
 
 // Free allocated memory
@@ -384,105 +441,269 @@ void cleanup(FileInfo *files, int file_count) {
     free(files);
 }
 
+// Pattern from --pattern: "auto" (-2), a number 1..N or an id; -1 when unknown
+static int find_pattern(const char *arg) {
+    if (strcmp(arg, "auto") == 0) return -2;
+    char *end;
+    errno = 0;
+    long number = strtol(arg, &end, 10);
+    if (errno == 0 && *arg && *end == '\0') {
+        return (number >= 1 && number <= num_patterns) ? (int)number - 1 : -1;
+    }
+    for (int i = 0; i < num_patterns; i++) {
+        if (strcmp(arg, patterns[i].id) == 0) return i;
+    }
+    return -1;
+}
+
+// The pattern matching the most files (the first one on a tie); -1 when none matches
+static int best_pattern(const PatternResult *results) {
+    int best = -1;
+    for (int i = 0; i < num_patterns; i++) {
+        if (results[i].total_matches > 0 && (best < 0 || results[i].total_matches > results[best].total_matches)) {
+            best = i;
+        }
+    }
+    return best;
+}
+
+static void list_patterns(void) {
+    for (int i = 0; i < num_patterns; i++) {
+        printf("%2d  %-16s  %-18s  %s\n", i + 1, patterns[i].id, patterns[i].name, patterns[i].description);
+    }
+}
+
+static void usage(const char *program) {
+    printf("Usage: %s [options] [directory]\n\n", program);
+    printf("Without --pattern and --name, mrename asks interactively.\n\n");
+    printf("  -p, --pattern PATTERN  auto (best match), a number or an id from --list-patterns\n");
+    printf("  -n, --name NAME        series name used for the new file names\n");
+    printf("  -d, --dry-run          show what would be renamed, change nothing\n");
+    printf("  -l, --list-patterns    list the naming patterns and exit\n");
+    printf("  -V, --version          print the version and exit\n");
+    printf("  -h, --help             show this help and exit\n\n");
+    printf("Exit status: 0 done, 1 a file could not be renamed or no pattern matched, 2 bad usage.\n");
+}
+
+// Non-interactive run: one plain line per file, then a summary. Never overwrites a file.
+static int run_batch(const char *dir_path, const char *pattern_arg, const char *series_name, int dry_run) {
+    FileInfo *files = NULL;
+    int selected = find_pattern(pattern_arg);
+    if (selected == -1) {
+        fprintf(stderr, "mrename: unknown pattern '%s' (see --list-patterns)\n", pattern_arg);
+        return 2;
+    }
+    if (series_name[0] == '\0' || strlen(series_name) > MAX_NAME) {
+        fprintf(stderr, "mrename: the series name must be 1 to %d characters\n", MAX_NAME);
+        return 2;
+    }
+
+    int file_count = scan_directory(dir_path, &files);
+    if (file_count < 0) return 1;
+    if (file_count == 0) {
+        printf("No video files found in %s\n", dir_path);
+        free(files);
+        return 0;
+    }
+
+    if (selected == -2) {
+        PatternResult results[MAX_PATTERNS];
+        for (int i = 0; i < num_patterns; i++) {
+            results[i] = test_pattern(&patterns[i], files, file_count);
+        }
+        selected = best_pattern(results);
+        if (selected < 0) {
+            fprintf(stderr, "mrename: no pattern matches these files\n");
+            cleanup(files, file_count);
+            return 1;
+        }
+    }
+
+    PatternResult result = test_pattern(&patterns[selected], files, file_count);
+    printf("Pattern %s (%s): %d of %d video files match\n",
+           patterns[selected].id, patterns[selected].description, result.total_matches, file_count);
+
+    int renamed = 0, unchanged = 0, skipped = 0, failed = 0;
+    for (int i = 0; i < file_count; i++) {
+        if (!files[i].matched) {
+            printf("skipped (no match): %s\n", files[i].basename);
+            skipped++;
+            continue;
+        }
+        generate_new_name(&files[i], series_name);
+        switch (rename_one(files, i, dry_run)) {
+        case RENAME_DONE:
+            printf("%s: %s -> %s\n", dry_run ? "would rename" : "renamed", files[i].basename, files[i].new_name);
+            renamed++;
+            break;
+        case RENAME_UNCHANGED:
+            printf("unchanged: %s\n", files[i].basename);
+            unchanged++;
+            break;
+        case RENAME_EXISTS:
+            printf("failed (target exists): %s -> %s\n", files[i].basename, files[i].new_name);
+            failed++;
+            break;
+        case RENAME_DUPLICATE:
+            printf("failed (same name as another file): %s -> %s\n", files[i].basename, files[i].new_name);
+            failed++;
+            break;
+        case RENAME_ERROR:
+            printf("failed (%s): %s\n", strerror(errno), files[i].basename);
+            failed++;
+            break;
+        }
+    }
+
+    printf("%s: %d %s, %d unchanged, %d skipped, %d failed\n",
+           dry_run ? "Dry run" : "Done", renamed, dry_run ? "would be renamed" : "renamed",
+           unchanged, skipped, failed);
+    cleanup(files, file_count);
+    return failed > 0 ? 1 : 0;
+}
+
 // Main program
 int main(int argc, char *argv[]) {
     char *dir_path = ".";
     char series_name[256];
     FileInfo *files = NULL;
     int file_count;
-    
-    // Clear screen and show header
-    printf(CLEAR_SCREEN);
-    print_color(BOLD MAGENTA, "\n🎬 TV SERIES FILE RENAMER v2.0\n");
-    print_color(DIM WHITE, "High-performance batch renaming with pattern recognition\n\n");
-    
-    // Parse arguments
-    if (argc > 1) {
-        if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
-            printf("Usage: %s [directory]\n", argv[0]);
-            printf("  directory  Target directory (default: current directory)\n\n");
-            return 0;
+    const char *pattern_arg = NULL;
+    const char *name_arg = NULL;
+    int dry_run = 0;
+
+    use_color = isatty(STDOUT_FILENO) && getenv("NO_COLOR") == NULL;
+
+    static const struct option options[] = {
+        {"pattern", required_argument, NULL, 'p'},
+        {"name", required_argument, NULL, 'n'},
+        {"dry-run", no_argument, NULL, 'd'},
+        {"list-patterns", no_argument, NULL, 'l'},
+        {"version", no_argument, NULL, 'V'},
+        {"help", no_argument, NULL, 'h'},
+        {NULL, 0, NULL, 0}
+    };
+    int option;
+    while ((option = getopt_long(argc, argv, "p:n:dlVh", options, NULL)) != -1) {
+        switch (option) {
+        case 'p': pattern_arg = optarg; break;
+        case 'n': name_arg = optarg; break;
+        case 'd': dry_run = 1; break;
+        case 'l': list_patterns(); return 0;
+        case 'V': printf("mrename %s\n", MRENAME_VERSION); return 0;
+        case 'h': usage(argv[0]); return 0;
+        default: usage(argv[0]); return 2;
         }
-        dir_path = argv[1];
     }
-    
+    if (optind < argc) dir_path = argv[optind++];
+    if (optind < argc) {
+        fprintf(stderr, "mrename: only one directory can be given\n");
+        return 2;
+    }
+
     // Check if directory exists
     struct stat st;
     if (stat(dir_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
-        print_color(RED, "Error: Directory '%s' does not exist!\n", dir_path);
+        fprintf(stderr, "mrename: directory '%s' does not exist\n", dir_path);
         return 1;
     }
-    
+
+    if (pattern_arg || name_arg || dry_run) {
+        if (!pattern_arg || !name_arg) {
+            fprintf(stderr, "mrename: --pattern and --name go together (--dry-run needs both)\n");
+            return 2;
+        }
+        return run_batch(dir_path, pattern_arg, name_arg, dry_run);
+    }
+
+    if (!isatty(STDIN_FILENO)) {
+        fprintf(stderr, "mrename: not in a terminal; give --pattern and --name (see --help)\n");
+        return 2;
+    }
+
+    // Clear screen and show header
+    printf("%s", C(CLEAR_SCREEN));
+    print_color(BOLD MAGENTA, "\n🎬 TV SERIES FILE RENAMER %s\n", MRENAME_VERSION);
+    print_color(DIM WHITE, "High-performance batch renaming with pattern recognition\n\n");
+
     print_color(CYAN, "📁 Target directory: %s\n", dir_path);
-    
+
     // Scan directory
     print_color(YELLOW, "\n⏳ Scanning directory...");
     fflush(stdout);
-    
+
     clock_t start = clock();
     file_count = scan_directory(dir_path, &files);
     clock_t end = clock();
     double scan_time = ((double)(end - start)) / CLOCKS_PER_SEC;
-    
-    printf("\r" CLEAR_LINE);
-    
+
+    printf("\r%s", C(CLEAR_LINE));
+
     if (file_count <= 0) {
         print_color(RED, "No video files found in directory!\n");
+        if (file_count == 0) free(files);
         return 1;
     }
-    
+
     print_color(GREEN, "✓ Found %d video files in %.3f seconds\n", file_count, scan_time);
-    
+
     // Test all patterns
     print_color(YELLOW, "🔍 Analyzing file patterns...\n");
-    
+
     PatternResult results[MAX_PATTERNS];
     for (int i = 0; i < num_patterns; i++) {
         results[i] = test_pattern(&patterns[i], files, file_count);
     }
-    
+
     // Display analysis table
     display_pattern_analysis(results, file_count);
-    
+
     // Get user input for pattern selection
     int selected_pattern;
     while (1) {
         print_color(YELLOW, "\n📌 Select pattern (1-%d, 0 to quit): ", num_patterns);
-        if (scanf("%d", &selected_pattern) != 1) {
-            while (getchar() != '\n'); // Clear input buffer
+        int read = scanf("%d", &selected_pattern);
+        if (read == EOF) {
+            cleanup(files, file_count);
+            return 1;
+        }
+        if (read != 1) {
+            int c;
+            while ((c = getchar()) != '\n' && c != EOF); // Clear input buffer
             continue;
         }
-        
+
         if (selected_pattern == 0) {
             print_color(YELLOW, "Exiting...\n");
             cleanup(files, file_count);
             return 0;
         }
-        
+
         if (selected_pattern >= 1 && selected_pattern <= num_patterns) {
             selected_pattern--; // Convert to 0-based index
             break;
         }
-        
+
         print_color(RED, "Invalid selection! Please choose 1-%d or 0 to quit.\n", num_patterns);
     }
-    
+
     // Get series name
     print_color(YELLOW, "\n📝 Enter series name: ");
-    while (getchar() != '\n'); // Clear input buffer
+    int c;
+    while ((c = getchar()) != '\n' && c != EOF); // Clear input buffer
     if (!fgets(series_name, sizeof(series_name), stdin)) {
         print_color(RED, "Failed to read series name!\n");
         cleanup(files, file_count);
         return 1;
     }
     series_name[strcspn(series_name, "\n")] = '\0'; // Remove newline
-    
-    if (strlen(series_name) == 0) {
-        print_color(RED, "Series name cannot be empty!\n");
+
+    if (strlen(series_name) == 0 || strlen(series_name) > MAX_NAME) {
+        print_color(RED, "The series name must be 1 to %d characters!\n", MAX_NAME);
         cleanup(files, file_count);
         return 1;
     }
-    
+
     // Apply selected pattern and generate new names
     test_pattern(&patterns[selected_pattern], files, file_count);
     for (int i = 0; i < file_count; i++) {
@@ -490,25 +711,25 @@ int main(int argc, char *argv[]) {
             generate_new_name(&files[i], series_name);
         }
     }
-    
+
     // Show preview
     display_rename_preview(files, file_count);
-    
+
     // Confirm rename
-    char confirm;
+    int failed = 0;
     print_color(BOLD YELLOW, "\n⚠️  Proceed with renaming? (y/N): ");
-    confirm = getchar();
-    
+    int confirm = getchar();
+
     if (confirm == 'y' || confirm == 'Y') {
-        perform_rename(files, file_count);
+        failed = perform_rename(files, file_count);
     } else {
         print_color(YELLOW, "Renaming cancelled.\n");
     }
-    
+
     // Cleanup
     cleanup(files, file_count);
-    
+
     print_color(DIM WHITE, "\n👋 Thank you for using TV Series Renamer!\n\n");
-    
-    return 0;
+
+    return failed > 0 ? 1 : 0;
 }
